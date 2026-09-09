@@ -5,11 +5,13 @@ Handles sheet creation, schedule creation, and document export
 """
 
 from utils import get_element_name, get_element_id_value, suppress_warnings
+from document_identity import require_expected_document
 from pyrevit import routes, revit, DB
 import json
 import traceback
 import logging
 import os
+import tempfile
 
 logger = logging.getLogger(__name__)
 
@@ -327,30 +329,47 @@ def register_documentation_routes(api):
 
             actual_view_name = get_element_name(target_view)
 
-            # Determine export path
-            export_dir = os.path.join(
-                os.environ.get("USERPROFILE", os.environ.get("HOME", "C:\\")),
-                "Documents",
-                "RevitMCPExport",
-            )
-            if not os.path.exists(export_dir):
-                os.makedirs(export_dir)
-
             fmt = export_format.lower()
+            export_dir = data.get('output_dir')
+            output_filename = data.get('output_filename')
+            if not isinstance(export_dir, basestring) or not isinstance(output_filename, basestring):
+                return routes.make_response(data={'error': 'output_dir and output_filename are required'}, status=400)
+            if os.path.basename(output_filename) != output_filename or output_filename in ('', '.', '..'):
+                return routes.make_response(data={'error': 'output_filename must be a bare filename'}, status=400)
+            expected_ext = '.jpg' if fmt == 'jpg' else '.' + fmt
+            if not output_filename.lower().endswith(expected_ext):
+                return routes.make_response(data={'error': 'output_filename extension must match format'}, status=400)
+            if not os.path.isabs(export_dir) or not os.path.isdir(export_dir):
+                return routes.make_response(data={'error': 'output_dir must be an existing absolute PC-generated directory'}, status=400)
+            if os.listdir(export_dir):
+                return routes.make_response(data={'error': 'output_dir must be empty for this export call'}, status=409)
+            file_path = os.path.join(export_dir, output_filename)
+            require_expected_document(doc, data)
+
+            # A JPG request must never claim success with a PNG fallback.
+            # Validate this before the export transaction starts.
+            jpg_type = None
+            if fmt == "jpg":
+                jpg_type = getattr(DB.ImageFileType, "JPGMedium", None)
+                if jpg_type is None:
+                    return routes.make_response(
+                        data={'error': 'JPG export is unavailable in this Revit version'},
+                        status=500,
+                    )
 
             t = DB.Transaction(doc, "Export Document via MCP")
             t.Start()
             suppress_warnings(t)
 
             try:
-                file_path = ""
-                file_size_kb = 0
+                file_size_bytes = 0
 
                 if fmt == "png" or fmt == "jpg":
                     # Image export
                     options = DB.ImageExportOptions()
                     options.ZoomType = DB.ZoomFitType.FitToPage
-                    options.PixelSize = resolution
+                    options.PixelSize = max(1024, resolution)
+                    options.ImageResolution = DB.ImageResolution.DPI_150
                     options.ExportRange = DB.ExportRange.SetOfViews
 
                     view_set = DB.ViewSet()
@@ -364,23 +383,36 @@ def register_documentation_routes(api):
 
                     if fmt == "png":
                         options.HLRandWFViewsFileType = DB.ImageFileType.PNG
+                        options.ShadowViewsFileType = DB.ImageFileType.PNG
+                        actual_ext = ".png"
                     else:
-                        options.HLRandWFViewsFileType = DB.ImageFileType.JPGMedium
+                        options.HLRandWFViewsFileType = jpg_type
+                        actual_ext = ".jpg"
 
-                    safe_name = actual_view_name.replace(" ", "_").replace("/", "_")
-                    options.FilePath = os.path.join(export_dir, safe_name)
+                    options.FilePath = file_path
 
                     doc.ExportImage(options)
+                    image_outputs = [
+                        os.path.join(export_dir, name)
+                        for name in os.listdir(export_dir)
+                        if name.lower().endswith(actual_ext) and os.path.isfile(os.path.join(export_dir, name))
+                    ]
+                    if len(image_outputs) != 1:
+                        t.RollBack()
+                        return routes.make_response(
+                            data={'error': 'Image export did not produce exactly one new requested-format file'},
+                            status=500,
+                        )
+                    # Revit can append view tokens to FilePath. The empty job directory
+                    # makes this sole current-call output authoritative without a shared scan.
+                    file_path = image_outputs[0]
 
-                    # Find the exported file
-                    expected_ext = ".png" if fmt == "png" else ".jpg"
-                    file_path = os.path.join(export_dir, safe_name + expected_ext)
 
                 elif fmt == "pdf":
                     # PDF export (Revit 2022+)
                     try:
                         pdf_options = DB.PDFExportOptions()
-                        pdf_options.FileName = actual_view_name.replace(" ", "_")
+                        pdf_options.FileName = os.path.splitext(output_filename)[0]
                         pdf_options.Combine = True
 
                         from System.Collections.Generic import List
@@ -389,13 +421,7 @@ def register_documentation_routes(api):
 
                         success = doc.Export(export_dir, view_ids, pdf_options)
 
-                        if success:
-                            file_path = os.path.join(
-                                export_dir,
-                                actual_view_name.replace(" ", "_") + ".pdf"
-                            )
-                        else:
-                            # Fallback to image
+                        if not success:
                             t.RollBack()
                             return routes.make_response(
                                 data={
@@ -421,9 +447,10 @@ def register_documentation_routes(api):
                         view_ids = List[DB.ElementId]()
                         view_ids.Add(target_view.Id)
 
-                        safe_name = actual_view_name.replace(" ", "_")
-                        doc.Export(export_dir, safe_name, view_ids, dwg_options)
-                        file_path = os.path.join(export_dir, safe_name + ".dwg")
+                        success = doc.Export(export_dir, os.path.splitext(output_filename)[0], view_ids, dwg_options)
+                        if not success:
+                            t.RollBack()
+                            return routes.make_response(data={'error': 'DWG export API returned failure'}, status=500)
                     except Exception as dwg_err:
                         t.RollBack()
                         return routes.make_response(
@@ -433,12 +460,18 @@ def register_documentation_routes(api):
 
                 t.Commit()
 
-                # Get file size
+                # Use raw bytes so a valid small file does not round down to zero KB.
                 try:
                     if file_path and os.path.exists(file_path):
-                        file_size_kb = int(os.path.getsize(file_path) / 1024)
+                        file_size_bytes = os.path.getsize(file_path)
                 except Exception:
                     pass
+
+                if file_size_bytes <= 0:
+                    return routes.make_response(
+                        data={"error": "Export API completed without the requested nonempty file", "format": fmt},
+                        status=500,
+                    )
 
                 return routes.make_response(
                     data={
@@ -447,10 +480,10 @@ def register_documentation_routes(api):
                             "view_name": actual_view_name,
                             "format": fmt,
                             "file_path": file_path,
-                            "file_size_kb": file_size_kb,
+                            "file_size_bytes": file_size_bytes,
                         },
-                        "message": "Exported '{}' to {} ({} KB)".format(
-                            actual_view_name, fmt.upper(), file_size_kb
+                        "message": "Exported '{}' to {} ({} bytes)".format(
+                            actual_view_name, fmt.upper(), file_size_bytes
                         ),
                     }
                 )

@@ -5,6 +5,7 @@ Handles API status and health check endpoints
 """
 
 from pyrevit import routes
+from document_identity import document_fingerprint
 import logging
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ def register_status_routes(api):
                     "health": "healthy",
                     "revit_available": True,
                     "document_title": doc.Title if doc.Title else "Untitled",
+                    "document_fingerprint": document_fingerprint(doc),
                     "api_name": "revit_mcp"
                 })
             else:

@@ -5,6 +5,7 @@ Handles IFC export and external file linking/importing
 """
 
 from utils import get_element_name, get_element_id_value, suppress_warnings
+from document_identity import require_expected_document
 from pyrevit import routes, revit, DB
 import clr
 import json
@@ -43,6 +44,8 @@ def register_interop_routes(api):
                     data={"error": "file_path must end in .ifc"},
                     status=400,
                 )
+            if not os.path.isabs(file_path):
+                return routes.make_response(data={"error": "file_path must be an absolute PC-generated IFC target"}, status=400)
 
             ifc_version = data.get("ifc_version", "IFC2x3")
             export_base_quantities = data.get("export_base_quantities", True)
@@ -60,8 +63,11 @@ def register_interop_routes(api):
                         data={"error": "Cannot create output directory: {}".format(str(dir_err))},
                         status=500,
                     )
+            if os.path.exists(file_path):
+                return routes.make_response(data={"error": "requested IFC target already exists"}, status=409)
 
             # Set up IFC export options
+            require_expected_document(doc, data)
             ifc_options = DB.IFCExportOptions()
 
             # Set IFC version
@@ -93,28 +99,33 @@ def register_interop_routes(api):
             suppress_warnings(t)
 
             try:
-                doc.Export(output_dir or ".", file_name, ifc_options)
+                success = doc.Export(output_dir or ".", file_name, ifc_options)
+                if not success:
+                    t.RollBack()
+                    return routes.make_response(data={"error": "IFC export API returned failure"}, status=500)
                 t.Commit()
             except Exception as tx_error:
                 if t.HasStarted() and not t.HasEnded():
                     t.RollBack()
                 raise tx_error
 
-            # Get file size
-            file_size_kb = 0
+            # Current-call success requires this exact requested target.
+            file_size_bytes = 0
             try:
                 if os.path.exists(file_path):
-                    file_size_kb = int(os.path.getsize(file_path) / 1024)
+                    file_size_bytes = os.path.getsize(file_path)
             except Exception:
                 pass
 
+            if file_size_bytes <= 0:
+                return routes.make_response(data={"error": "IFC export produced no requested nonempty file"}, status=500)
             return routes.make_response(
                 data={
                     "status": "success",
                     "file_path": file_path,
-                    "file_size_kb": file_size_kb,
+                    "file_size_bytes": file_size_bytes,
                     "ifc_version": ifc_version,
-                    "message": "Exported IFC to '{}' ({} KB)".format(file_path, file_size_kb),
+                    "message": "Exported IFC to '{}' ({} bytes)".format(file_path, file_size_bytes),
                 }
             )
 

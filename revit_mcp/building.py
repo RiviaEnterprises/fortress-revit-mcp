@@ -6,6 +6,7 @@ elements (floors, roofs, ceilings), and levels.
 """
 
 from utils import get_element_name, get_element_id_value, suppress_warnings
+from document_identity import require_expected_document
 from pyrevit import routes, revit, DB
 from System.Collections.Generic import List
 import json
@@ -602,6 +603,7 @@ def register_building_routes(api):
             created = []
             errors = []
 
+            require_expected_document(doc, data)
             t = DB.Transaction(doc, "Create Levels")
             t.Start()
             suppress_warnings(t)

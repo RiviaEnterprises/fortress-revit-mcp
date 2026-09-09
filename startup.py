@@ -45,6 +45,10 @@ def register_routes():
 
         register_building_routes(api)
 
+        from revit_mcp.terrain import register_terrain_routes
+
+        register_terrain_routes(api)
+
         from revit_mcp.editing import register_editing_routes
 
         register_editing_routes(api)
